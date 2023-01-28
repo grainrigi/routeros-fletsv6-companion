@@ -156,20 +156,135 @@ func loadRAConfig() (*RAConfig, error) {
 		if poolStr == "" {
 			poolStr = "ra-prefix@fletsv6-pool/64"
 		}
-		poolStrs := strings.Split(poolStr, ",")
-		for _, poolstr := range poolStrs {
-			if poolstr == "" {
-				continue
+		if poolStr != "none" {
+			poolStrs := strings.Split(poolStr, ",")
+			for _, poolstr := range poolStrs {
+				if poolstr == "" {
+					continue
+				}
+				pool, err := ParseROSPoolAssign(poolstr)
+				if err != nil {
+					return nil, fmt.Errorf("Invalid ROS pool: %s", err)
+				}
+				cfg.rosPools = append(cfg.rosPools, pool)
 			}
-			pool, err := ParseROSPoolAssign(poolstr)
-			if err != nil {
-				return nil, fmt.Errorf("Invalid ROS pool: %s", err)
-			}
-			cfg.rosPools = append(cfg.rosPools, pool)
 		}
 	}
 
 	return &cfg, nil
+}
+
+// second return value is needROS
+func loadNDConfig(racfg *RAConfig) (*NDConfig, bool, error) {
+	cfg := &NDConfig{}
+	needROS := false
+
+	cfg.mode = os.Getenv("NDP_MODE")
+	if cfg.mode == "" {
+		cfg.mode = "proxy-ros"
+	}
+	if cfg.mode != "off" &&
+		cfg.mode != "static" &&
+		cfg.mode != "proxy" &&
+		cfg.mode != "proxy-ros" &&
+		cfg.mode != "proxy-ros:strict" {
+		return nil, false, fmt.Errorf("Unknown NDP_MODE %s", cfg.mode)
+	}
+
+	if cfg.mode == "off" {
+		return cfg, false, nil
+	}
+	if cfg.mode == "proxy-ros" {
+		needROS = true
+	}
+
+	prefixes := os.Getenv("NDP_PREFIXES")
+	if prefixes == "" {
+		prefixes = "ra-prefix"
+	}
+	for _, prefixStr := range strings.Split(prefixes, ",") {
+		fip, err := ParseFlexibleIP(prefixStr)
+		if err != nil {
+			return nil, false, fmt.Errorf("Error while reading NDP_PREFIXES: %s", err)
+		}
+		if fip.raPrefix && racfg.mode == "off" {
+			return nil, false, fmt.Errorf("You cannot use ra-prefix in NDP_PREFIXES while you set RA_MODE=off")
+		}
+		cfg.prefixes = append(cfg.prefixes, fip)
+	}
+
+	excludeIps := os.Getenv("NDP_EXCLUDE_IPS")
+	if excludeIps == "" {
+		excludeIps = "ra-externalips"
+	}
+	if excludeIps != "none" {
+		for _, ipStr := range strings.Split(excludeIps, ",") {
+			if ipStr == "ra-externalips" {
+				for _, assign := range racfg.rosExtIPs {
+					cfg.excludes = append(cfg.excludes, assign.ip)
+				}
+			} else if ipStr == "ra-internalips" {
+				for _, assign := range racfg.rosIntIPs {
+					cfg.excludes = append(cfg.excludes, assign.ip)
+				}
+			} else {
+				fip, err := ParseFlexibleIP(ipStr)
+				if err != nil {
+					return nil, false, fmt.Errorf("Error while reading NDP_EXCLUDE_IPS: %s", err)
+				}
+				cfg.excludes = append(cfg.excludes, fip)
+			}
+		}
+	}
+
+	extIfs := os.Getenv("NDP_EXTERNAL_INTERFACES")
+	if extIfs == "" {
+		extIfs = "eth0"
+	}
+	cfg.extIfs = strings.Split(extIfs, ",")
+
+	if cfg.mode == "proxy" {
+		intIfs := os.Getenv("NDP_INTERNAL_INTERFACES")
+		if intIfs == "" {
+			return nil, false, fmt.Errorf("You must specify at least one interface in NDP_INTERNAL_INTERFACES to use NDP_MODE=proxy")
+		}
+		cfg.intIfs = strings.Split(intIfs, ",")
+	}
+
+	timeoutStr := os.Getenv("NDP_TIMEOUT")
+	if timeoutStr == "" {
+		timeoutStr = "1000"
+	}
+	timeoutMs, err := strconv.Atoi(timeoutStr)
+	if err != nil {
+		return nil, false, fmt.Errorf("NDP_TIMEOUT is not a valid integer")
+	}
+	if cfg.mode == "proxy-ros" && (timeoutMs < 10 || timeoutMs > 5000) {
+		return nil, false, fmt.Errorf("NDP_TIMEOUT is out of range")
+	}
+	cfg.timeoutMs = timeoutMs
+
+	advMACs := os.Getenv("NDP_ADVERTISE_MACS")
+	if advMACs == "" {
+		advMACs = "@@external"
+	}
+	for _, advMAC := range strings.Split(advMACs, ",") {
+		if len(advMAC) == 0 {
+			continue
+		}
+		if advMAC[0] == '@' {
+			cfg.advMACs = append(cfg.advMACs, MACRef{rosIf: advMAC[1:]})
+			needROS = true
+		} else {
+			hwaddr, err := net.ParseMAC(advMAC)
+			if err != nil {
+				return nil, false, fmt.Errorf("[WARNING] Invalid MAC Address %s in NDP_ADVERTISE_MACS", advMAC)
+			}
+			cfg.advMACs = append(cfg.advMACs, MACRef{hwaddr: hwaddr})
+		}
+	}
+
+	return cfg, needROS, nil
 }
 
 func loadConfig(cfg *Config) error {
@@ -202,7 +317,7 @@ func ParseFlexibleIP(ipstr string) (FlexibleIP, error) {
 		if i.ip == nil {
 			return i, err
 		}
-		i.cidr = -1
+		i.cidr = 128
 		return i, nil
 	}
 	i.ip = ip

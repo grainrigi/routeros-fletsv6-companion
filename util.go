@@ -1,11 +1,7 @@
 package main
 
 import (
-	"fmt"
 	"net"
-	"os"
-	"strings"
-	"syscall"
 
 	"golang.org/x/net/bpf"
 )
@@ -71,51 +67,12 @@ type Interface struct {
 	name  string
 }
 
-func openInterface(ifnames []string) (*Interface, error) {
-	var i Interface
-
-	if len(ifnames) == 0 {
-		return nil, fmt.Errorf("No interface given")
-	}
-
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, htons(syscall.ETH_P_IPV6))
-	if err != nil {
-		return nil, err
-	}
-	i.fd = fd
-
-	var errs []string
-	for _, _ = range ifnames {
-		/*
-			ifindex, err := bindToDeviceRaw(fd, ifname)
-			if err == nil {
-				log.Printf("Using interface %s", ifname)
-				i.index = ifindex
-				i.name = ifname
-				return &i, nil
-			}
-			errs = append(errs, fmt.Sprintf("%s: \"%s\"", ifname, err))
-		*/
-	}
-
-	_ = syscall.Close(fd)
-	return nil, fmt.Errorf("All specified interfaces are unavailable: %s", strings.Join(errs, ", "))
-}
-
-func openFdFile(fd int) *os.File {
-	return os.NewFile(uintptr(fd), fmt.Sprintf("fd %d", fd))
-}
-
 func cidrEqual(cidrstr string, cidr net.IPNet) bool {
 	ip2, cidr2, err := net.ParseCIDR(cidrstr)
 	cidr2.IP = ip2
 	if err == nil && cidr.String() == cidr2.String() {
 		return true
 	}
-	return false
-}
-
-func cidrIPEqual(cidrstr string, cidr net.IPNet) bool {
 	return false
 }
 

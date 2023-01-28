@@ -1,12 +1,9 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"log"
 	"net"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -16,12 +13,9 @@ import (
 )
 
 type Socket struct {
-	fd        int
-	netif     *net.Interface
-	isValid   bool
-	readChans []chan *Socket
-	readable  bool
-	mutex     sync.Mutex
+	fd      int
+	netif   *net.Interface
+	isValid bool
 }
 
 type SocketReadResult struct {
@@ -50,29 +44,7 @@ func NewSocket(ifindex int) (*Socket, error) {
 		return nil, err
 	}
 
-	if err := startListenSock(fd, s); err != nil {
-		_ = syscall.Close(fd)
-		return nil, err
-	}
-
 	s.isValid = true
-
-	// launch peeker
-	go func() {
-		buf := make([]byte, 2000)
-		for {
-			if !s.isValid {
-				break
-			}
-			n, _, err := syscall.Recvfrom(s.fd, buf, syscall.MSG_PEEK)
-			if err == nil {
-				log.Printf("from peeker(fd=%d): %+v", s.fd, buf[:n])
-			} else if err != syscall.EAGAIN {
-				log.Printf("[WARN] peek message failed on fd=%d: %s", s.fd, err)
-			}
-			<-time.After(time.Second * 10)
-		}
-	}()
 
 	return s, nil
 }
@@ -85,53 +57,33 @@ func (s *Socket) readImmediate() ([]byte, error) {
 	var buf [2048]byte
 	n, err := syscall.Read(s.fd, buf[:])
 	if err == syscall.EAGAIN {
-		log.Printf("Got EAGAIN fd=%d", s.fd)
-		s.unsetReadable()
 		return nil, nil
 	} else if err != nil {
 		return nil, err
 	} else {
-		// peek message
-		_, _, err := syscall.Recvfrom(s.fd, []byte{}, syscall.MSG_PEEK)
-		if err == nil {
-			// still have message
-			s.notifyReadable()
-		} else if err != syscall.EAGAIN {
-			log.Printf("[WARN] peek message failed on fd=%d: %s", s.fd, err)
-		}
 		return buf[:n], nil
 	}
 }
 
 func (s *Socket) ReadOnce(timeout *time.Duration) ([]byte, error) {
-	data, err := s.readImmediate()
+	s2, err := epollOnce([]*Socket{s}, timeout)
 	if err != nil {
 		return nil, err
-	} else if data != nil {
-		return data, err
-	} else {
-		ch := make(chan *Socket)
-		s.addReadChan(ch)
-		if timeout == nil {
-			<-ch
-		} else {
-			select {
-			case <-ch:
-				if !s.isValid {
-					return nil, fmt.Errorf("the socket has been closed")
-				}
-			case <-time.After(*timeout):
-				return nil, fmt.Errorf("Socket.ReadOnce timed out after %s", *timeout)
-			}
-		}
-		return s.readImmediate()
 	}
+	if !s.isValid {
+		return nil, fmt.Errorf("the socket has been closed")
+	}
+
+	if s2 == nil {
+		return nil, fmt.Errorf("Read timed out")
+	}
+	return s.readImmediate()
 }
 
 func (s *Socket) LinkLocal() net.IP {
 	ips, err := s.netif.Addrs()
 	if err != nil {
-		log.Printf("s.netif.Addrs() failed %s", err)
+		llog.Warning("s.netif.Addrs() failed %s", err)
 		return nil
 	}
 	errs := []string{}
@@ -147,7 +99,7 @@ func (s *Socket) LinkLocal() net.IP {
 			errs = append(errs, fmt.Sprintf("%T is not IPNet", addr))
 		}
 	}
-	log.Printf("%s has no link local address: %s", s.netif.Name, strings.Join(errs, ","))
+	llog.Warning("%s has no link local address: %s", s.netif.Name, strings.Join(errs, ","))
 	return nil
 }
 
@@ -169,37 +121,22 @@ func (s *Socket) WriteOnce(packet []byte) error {
 }
 
 func ReadMultiSocksOnce(socks []*Socket) (int, []byte, error) {
-	// try immediate
-	for i, s := range socks {
-		data, err := s.readImmediate()
-		if err != nil {
-			return 0, nil, err
-		} else if data != nil {
-			return i, data, nil
+	s, err := epollOnce(socks, nil)
+	if err != nil {
+		return -1, nil, err
+	} else if s == nil {
+		return -1, nil, fmt.Errorf("epollOnce returned nil *Socket (it seems to be a bug)")
+	}
+
+	for i, so := range socks {
+		if so == s {
+			data, err := so.readImmediate()
+			return i, data, err
 		}
 	}
-	// async read
-	ch := make(chan *Socket)
-	for _, s := range socks {
-		s.addReadChan(ch)
-	}
-	for {
-		asyncs := <-ch
-		// close all channels
-		for _, s := range socks {
-			s.removeReadChan(ch)
-		}
-		close(ch)
-		if asyncs.isValid {
-			data, err := asyncs.readImmediate()
-			for i, s := range socks {
-				if asyncs == s {
-					return i, data, err
-				}
-			}
-			return -1, data, err
-		}
-	}
+
+	// would not reach here
+	return -1, nil, fmt.Errorf("Unexpected code reached")
 }
 
 func (s *Socket) ClearBuf() error {
@@ -219,77 +156,22 @@ func (s *Socket) Close() error {
 		return nil
 	}
 	s.isValid = false
-	for _, ch := range s.readChans {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
 	return syscall.Close(s.fd)
-}
-
-func (s *Socket) notifyReadable() {
-	log.Printf("notifyReadable fd=%d", s.fd)
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-retry:
-	if len(s.readChans) > 0 {
-		select {
-		case s.readChans[0] <- s:
-			log.Printf("sent to first listening sock fd=%d", s.fd)
-		default:
-			goto retry
-		}
-		s.readChans = s.readChans[1:]
-	} else {
-		log.Printf("queueing to boolean fd=%d", s.fd)
-		s.readable = true
-	}
-}
-
-func (s *Socket) unsetReadable() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.readable = false
-}
-
-func (s *Socket) addReadChan(ch chan *Socket) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	if s.readable {
-		s.readable = false
-		select {
-		case ch <- s:
-		default:
-		}
-	} else {
-		s.readChans = append(s.readChans, ch)
-	}
-}
-
-func (s *Socket) removeReadChan(ch chan *Socket) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	var newChans []chan *Socket
-	for _, c := range s.readChans {
-		if c != ch {
-			newChans = append(newChans, c)
-		}
-	}
-	s.readChans = newChans
 }
 
 func (s *Socket) onClosed() {
 	s.isValid = false
-	stopListenSock(s.fd)
-	s.notifyReadable()
 }
 
-func (s *Socket) onReadable() {
-	s.notifyReadable()
-}
+// epoll
+func epollOnce(socks []*Socket, timeout *time.Duration) (*Socket, error) {
+	var timeoutMs int
+	if timeout == nil {
+		timeoutMs = -1
+	} else {
+		timeoutMs = int(*timeout / time.Millisecond)
+	}
 
-func epollOnce(socks []*Socket) (*Socket, error) {
 	events := make([]syscall.EpollEvent, len(socks))
 
 	epfd, err := syscall.EpollCreate1(0)
@@ -307,19 +189,21 @@ func epollOnce(socks []*Socket) (*Socket, error) {
 		}
 	}
 
-	nevents, err := syscall.EpollWait(epctx.epfd, events[:], -1)
+	var readSock *Socket
+
+	remainsock := len(socks)
+retry:
+	nevents, err := syscall.EpollWait(epfd, events[:], timeoutMs)
 	if err != nil {
 		return nil, fmt.Errorf("EpollWait failed: %s", err)
 	}
 
-	var readSock *Socket
 	for _, ev := range events[:nevents] {
 		fd := int(ev.Fd)
 		var sock *Socket
 		for _, s := range socks {
 			if s.fd == fd {
 				sock = s
-
 			}
 		}
 		if sock == nil {
@@ -327,8 +211,13 @@ func epollOnce(socks []*Socket) (*Socket, error) {
 		}
 		if (ev.Events&syscall.EPOLLERR) != 0 || (ev.Events&syscall.EPOLLHUP) != 0 {
 			sock.onClosed()
+			_ = syscall.EpollCtl(epfd, syscall.EPOLL_CTL_DEL, fd, nil)
+			remainsock--
+			if remainsock > 0 {
+				goto retry
+			}
 		}
-		if (ev.Events&syscall.EPOLLIN) != 0 && readSock != nil {
+		if (ev.Events&syscall.EPOLLIN) != 0 && readSock == nil {
 			readSock = sock
 		}
 	}
@@ -336,97 +225,6 @@ func epollOnce(socks []*Socket) (*Socket, error) {
 	_ = syscall.Close(epfd)
 
 	return readSock, nil
-}
-
-// epoll
-type EpollContext struct {
-	epfd  int
-	mu    sync.RWMutex
-	socks map[int]*Socket
-}
-
-type EpollReadCallback chan<- SocketReadResult
-
-var epctx EpollContext
-
-func initEpoll() error {
-	epfd, err := syscall.EpollCreate1(0)
-	if err != nil {
-		return err
-	}
-
-	epctx.epfd = epfd
-	epctx.socks = make(map[int]*Socket)
-
-	return nil
-}
-
-func startListenSock(fd int, sock *Socket) error {
-	epctx.mu.Lock()
-	_, exists := epctx.socks[fd]
-	epctx.mu.Unlock()
-	if !exists {
-		event := syscall.EpollEvent{
-			Events: syscall.EPOLLIN | (uint32(1) << 31), // EPOLLET
-			Fd:     int32(fd),
-		}
-
-		if err := syscall.EpollCtl(epctx.epfd, syscall.EPOLL_CTL_ADD, fd, &event); err != nil {
-			return fmt.Errorf("EPOLL_CTL_ADD failed: %s", err)
-		}
-	}
-
-	epctx.mu.Lock()
-	epctx.socks[fd] = sock
-	epctx.mu.Unlock()
-
-	return nil
-}
-
-func stopListenSock(fd int) {
-	epctx.mu.Lock()
-	if epctx.socks[fd] == nil {
-		epctx.mu.Unlock()
-		return
-	}
-	delete(epctx.socks, fd)
-	epctx.mu.Unlock()
-
-	if err := syscall.EpollCtl(epctx.epfd, syscall.EPOLL_CTL_DEL, fd, nil); err != nil {
-		log.Printf("[WARNING] EPOLL_CTL_DEL failed for fd %d: %s", fd, err)
-	}
-}
-
-func runEpollLoop(ctx context.Context) error {
-	var events [32]syscall.EpollEvent
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-		nevents, err := syscall.EpollWait(epctx.epfd, events[:], -1)
-		if err != nil {
-			return err
-		}
-
-		for _, ev := range events[:nevents] {
-			fd := int(ev.Fd)
-			epctx.mu.Lock()
-			sock := epctx.socks[fd]
-			epctx.mu.Unlock()
-			if sock == nil {
-				continue
-			}
-			if (ev.Events&syscall.EPOLLERR) != 0 || (ev.Events&syscall.EPOLLHUP) != 0 {
-				sock.onClosed()
-			}
-			if (ev.Events & syscall.EPOLLIN) != 0 {
-				sock.onReadable()
-			}
-		}
-	}
 }
 
 // util

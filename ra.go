@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -62,6 +61,38 @@ type RouterInfo struct {
 	gateway net.IP
 }
 
+func dumpRAConfig(cfg *RAConfig) {
+	llog.Debug("Router Advertisement Configuration:")
+	llog.Debug("  RA_MODE=%s", cfg.mode)
+	if len(cfg.extIfs) > 0 {
+		llog.Debug("  RA_EXTERNAL_INTERFACES=%+v", cfg.extIfs)
+	}
+	if cfg.timeout != 0 {
+		llog.Debug("  RA_TIMEOUT=%d", cfg.timeout/time.Millisecond)
+	}
+	if cfg.rosExtIf != "" {
+		llog.Debug("  RA_ROS_EXTERNAL_INTERFACE=%s", cfg.rosExtIf)
+	}
+	if len(cfg.rosExtIPs) > 0 {
+		llog.Debug("  RA_ROS_EXTERNAL_IPS")
+		for i, ass := range cfg.rosExtIPs {
+			llog.Debug("  %3d: %+v", i, ass)
+		}
+	}
+	if len(cfg.rosIntIPs) > 0 {
+		llog.Debug("  RA_ROS_INTERNAL_IPS")
+		for i, ass := range cfg.rosIntIPs {
+			llog.Debug("  %3d: %+v", i, ass)
+		}
+	}
+	if len(cfg.rosIntIPs) > 0 {
+		llog.Debug("  RA_ROS_INTERNAL_IPS")
+		for i, ass := range cfg.rosIntIPs {
+			llog.Debug("  %3d: %+v", i, ass)
+		}
+	}
+}
+
 func NewRAClient(cfg *RAConfig, ros *ROSClient) *RAClient {
 	return &RAClient{
 		cfg: cfg,
@@ -104,6 +135,7 @@ func (c *RAClient) receive(ctx context.Context, timeout bool) (*RouterInfo, erro
 		to = &c.cfg.timeout
 	}
 
+	llog.Debug("Waiting for router advertisement on %s (timeout=%d)", c.extSock.netif.Name, c.cfg.timeout/time.Millisecond)
 	select {
 	case result := <-c.extSock.ReadOnceChan(to):
 		if result.err != nil {
@@ -126,6 +158,7 @@ func (c *RAClient) receive(ctx context.Context, timeout bool) (*RouterInfo, erro
 			info.prefix = net.IPNet{IP: ip, Mask: net.CIDRMask(length, 128)}
 		}
 	}
+	llog.Debug("Received a router advertisement: gateway=%s prefix=%s", info.gateway.String(), info.prefix.String())
 
 	return &info, nil
 }
@@ -137,6 +170,7 @@ func (c *RAClient) soilicit(ctx context.Context) error {
 
 	for {
 		// send solicitation
+		llog.Debug("Sending out Router Solicitation via %s", c.extSock.netif.Name)
 		rs := makeRouterSolicitation(c.extSock.LinkLocal(), c.extSock.netif.HardwareAddr)
 		if err := c.extSock.WriteOnce(rs); err != nil {
 			return err
@@ -149,7 +183,7 @@ func (c *RAClient) soilicit(ctx context.Context) error {
 		if rinfo.prefix.IP == nil {
 			return fmt.Errorf("Router did not return a prefix")
 		}
-		log.Printf("Router solicited: prefix=%s gateway=%s", rinfo.prefix.String(), rinfo.gateway.String())
+		llog.Info("Router solicited: prefix=%s gateway=%s", rinfo.prefix.String(), rinfo.gateway.String())
 		func() {
 			c.infomu.Lock()
 			defer c.infomu.Unlock()
@@ -166,25 +200,25 @@ func (c *RAClient) reconcile() {
 		// apply ros config
 		if c.cfg.rosExtIf != "" {
 			if err := c.ros.SetIPv6Gateway(c.cfg.rosExtIf, c.routerInfo.gateway); err != nil {
-				log.Printf("[WARNING] ros.SetIPv6Gateway failed: %s", err)
+				llog.Warning("ros.SetIPv6Gateway failed: %s", err)
 			}
 		}
 		for _, eip := range c.cfg.rosExtIPs {
 			ip := c.ResolveFIP(eip.ip)
 			if err := c.ros.AssignIPv6(eip.ifname, ip, eip.ip.String(), eip.options); err != nil {
-				log.Printf("[WARNING] ros.AssignIPv6(%s, %s) failed: %s", eip.ifname, ip.String(), err)
+				llog.Warning("ros.AssignIPv6(%s, %s) failed: %s", eip.ifname, ip.String(), err)
 			}
 		}
 		for _, iip := range c.cfg.rosIntIPs {
 			ip := c.ResolveFIP(iip.ip)
 			if err := c.ros.AssignIPv6(iip.ifname, ip, iip.ip.String(), iip.options); err != nil {
-				log.Printf("[WARNING] ros.AssignIPv6(%s, %s) failed: %s", iip.ifname, ip.String(), err)
+				llog.Warning("ros.AssignIPv6(%s, %s) failed: %s", iip.ifname, ip.String(), err)
 			}
 		}
 		for _, pool := range c.cfg.rosPools {
 			prefix := c.ResolveFIP(pool.ip)
 			if err := c.ros.ExportIPv6Pool(pool.poolname, *prefix, pool.prefixLength); err != nil {
-				log.Printf("[WARNING] ros.ExprtIPv6Pool(%s, %s, %d) failed: %s", pool.poolname, prefix.String(), pool.prefixLength, err)
+				llog.Warning("ros.ExportIPv6Pool(%s, %s, %d) failed: %s", pool.poolname, prefix.String(), pool.prefixLength, err)
 			}
 		}
 	}
@@ -209,7 +243,7 @@ func (c *RAClient) workInternal(ctx context.Context) error {
 		}
 		if rinfo.prefix.String() != c.routerInfo.prefix.String() ||
 			!rinfo.gateway.Equal(c.routerInfo.gateway) {
-			log.Printf("RouterInfo changed: prefix=%s gateway=%s", rinfo.prefix.String(), rinfo.gateway.String())
+			llog.Info("RouterInfo changed: prefix=%s gateway=%s", rinfo.prefix.String(), rinfo.gateway.String())
 			func() {
 				c.infomu.Lock()
 				defer c.infomu.Unlock()
@@ -231,8 +265,8 @@ func (c *RAClient) Work(ctx context.Context) error {
 			default:
 			}
 			// holdoff timer
-			log.Printf("[WARNING] Router Advertisement Worker failed: %s", err)
-			log.Printf("Waiting 10s to avoid error bursting")
+			llog.Error("Router Advertisement Worker failed: %s", err)
+			llog.Error("Waiting 10s to avoid error bursting")
 		}
 		<-time.After(time.Second * 10)
 	}

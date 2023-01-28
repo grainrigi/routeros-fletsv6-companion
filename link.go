@@ -2,12 +2,14 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/vishvananda/netlink"
 )
+
+var vlanmutex sync.Mutex
 
 type DecodedInterface struct {
 	name string
@@ -47,7 +49,7 @@ func (i DecodedInterface) Exists() bool {
 		return err == nil
 	} else {
 		if err := i.PrepareVLAN(); err != nil {
-			log.Printf("[WARNING] Failed to prepare vlan %d on %s: %s", i.vlan, i.name, err)
+			llog.Warning("Failed to prepare vlan %d on %s: %s", i.vlan, i.name, err)
 			return false
 		} else {
 			return true
@@ -56,6 +58,8 @@ func (i DecodedInterface) Exists() bool {
 }
 
 func (i DecodedInterface) PrepareVLAN() error {
+	vlanmutex.Lock()
+	defer vlanmutex.Unlock()
 	result := checkVlanDev(i.name, i.ActualName(), i.vlan)
 	if result == 1 {
 		return fmt.Errorf("%s is not a vlan %d device for %s", i.ActualName(), i.vlan, i.name)
@@ -79,7 +83,7 @@ func findFirstInterface(ifnames []string) (*DecodedInterface, error) {
 	for _, name := range ifnames {
 		di, err := NewDecodedInterface(name)
 		if err != nil {
-			log.Printf("[WARNING] Ignoring malformed interface name %s", name)
+			llog.Warning("Ignoring malformed interface name %s", name)
 			continue
 		}
 		if di.Exists() {
@@ -95,7 +99,7 @@ func collectInterfaces(ifnames []string) (map[string]DecodedInterface, error) {
 	for _, name := range ifnames {
 		di, err := NewDecodedInterface(name)
 		if err != nil {
-			log.Printf("[WARNING] Ignoring malformed interface name %s", name)
+			llog.Warning("Ignoring malformed interface name %s", name)
 			continue
 		}
 		if di.Exists() {
@@ -112,6 +116,7 @@ func collectInterfaces(ifnames []string) (map[string]DecodedInterface, error) {
 
 // VLAN utility
 func createVlanDev(linkname string, devname string, id int) error {
+
 	master, err := netlink.LinkByName(linkname)
 	if err != nil {
 		return fmt.Errorf("netlink.LinkByName(\"%s\") failed: %s", linkname, err)

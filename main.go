@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
+	"github.com/grainrigi/routeros-fletsv6-companion/logger"
 )
 
 var daemonErrs = make(chan error)
+
+var llog = logger.NewBuiltinLogger()
 
 func startDaemon(ctx context.Context, f func(context.Context) error) {
 	go func() {
@@ -25,18 +25,19 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	dumpRAConfig(racfg)
+
+	ndcfg, ndNeedROS, err := loadNDConfig(racfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	dumpNDConfig(ndcfg)
 
 	ctx, _ := context.WithCancel(context.Background())
 
-	// init epoll
-	if err := initEpoll(); err != nil {
-		log.Fatalf("Failed to init epoll: %s", err)
-	}
-	go runEpollLoop(ctx)
-
 	// init ros (if necessary)
 	var ros *ROSClient
-	if racfg.mode == "ros" {
+	if racfg.mode == "ros" || ndNeedROS {
 		roscfg, err := loadROSConfig()
 		if err != nil {
 			log.Fatal(err)
@@ -48,69 +49,17 @@ func main() {
 	}
 
 	// startRA
+	rac := NewRAClient(racfg, ros)
 	if racfg.mode != "off" {
-		log.Print("Start RA Server")
-		rac := NewRAClient(racfg, ros)
+		llog.Info("Starting RA Server")
 		startDaemon(ctx, func(ctx context.Context) error { return rac.Work(ctx) })
+	}
+	// start ND
+	if ndcfg.mode != "off" {
+		llog.Info("Starting ND Server")
+		ndc := NewNDClient(ndcfg, rac, ros)
+		startDaemon(ctx, func(ctx context.Context) error { return ndc.Work(ctx) })
 	}
 
 	<-daemonErrs
-
-	return
-
-	var cfg Config
-
-	// load config
-	if err := loadConfig(&cfg); err != nil {
-		log.Fatal(err)
-	}
-
-	// Show config
-	log.Printf("PREFIXES: %v\n", cfg.prefixes)
-	log.Printf("INTERFACES: %v\n", cfg.ifnames)
-	log.Printf("ROUTERMAC: %s\n", cfg.routerMAC)
-	log.Printf("ROUTERIP: %v\n", cfg.routerIPs)
-
-	f, err := openNdInterface(cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	log.Println("Start watching")
-
-	var eth layers.Ethernet
-	var ip6 layers.IPv6
-	var icmp6 layers.ICMPv6
-	var icmp6nd layers.ICMPv6NeighborSolicitation
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp6, &icmp6nd)
-	decoded := []gopacket.LayerType{}
-
-	for {
-		buf := make([]byte, 2000)
-		numRead, err := f.Read(buf)
-		if err != nil {
-			fmt.Printf("%s", err)
-			continue
-		}
-		if err := parser.DecodeLayers(buf[:numRead], &decoded); err != nil {
-			fmt.Printf("%s", err)
-			continue
-		}
-		packet := processNd(NdSolicitation{
-			srcMAC:   eth.SrcMAC,
-			dstMAC:   eth.DstMAC,
-			srcIP:    ip6.SrcIP,
-			dstIP:    ip6.DstIP,
-			targetIP: icmp6nd.TargetAddress,
-		}, cfg)
-		if packet != nil {
-			n, err := f.Write(packet)
-			if err != nil {
-				fmt.Println(err.Error())
-			}
-			if n != len(packet) {
-				fmt.Printf("packet truncated: written=%d, sent=%d\n", len(packet), n)
-			}
-		}
-	}
 }

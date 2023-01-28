@@ -1,10 +1,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"net"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 func dumpByteSlice(b []byte) {
@@ -40,11 +42,6 @@ func dumpByteSlice(b []byte) {
 }
 
 func miscTest() {
-	if err := initEpoll(); err != nil {
-		log.Fatalf("initEpoll failed: %s", err)
-	}
-	go runEpollLoop(context.Background())
-
 	i1, _ := NewDecodedInterface("enp4s0")
 	i2, _ := NewDecodedInterface("enp4s0@101")
 	ii1, err := i1.Index()
@@ -182,5 +179,50 @@ func rosTest() {
 	err = c.AssignIPv6("loopback", &cidr, "ra-prefix::1/64", ROSIPOptions{Advertise: true, Eui64: true})
 	if err != nil {
 		log.Fatalf("AssignIPv6 failed: %s", err)
+	}
+}
+
+func multiSockTest() {
+	i1, _ := NewDecodedInterface("enp4s0")
+	i2, _ := NewDecodedInterface("enp4s0@101")
+	ii1, err := i1.Index()
+	if err != nil {
+		log.Fatalf("i1.Index failed: %s", err)
+	}
+	ii2, err := i2.Index()
+	if err != nil {
+		log.Fatalf("i2.Index failed: %s", err)
+	}
+	s1, err := NewSocket(ii1)
+	if err != nil {
+		log.Fatalf("NewSocket(ii1) failed: %s", err)
+	}
+	if err := s1.ApplyBPF(bpfICMPv6(128)); err != nil {
+		log.Fatalf("s1.ApplyBPF failed: %s", err)
+	}
+	s2, err := NewSocket(ii2)
+	if err != nil {
+		log.Fatal("NewSocket(ii2) failed: %s", err)
+	}
+	if err := s2.ApplyBPF(bpfICMPv6(128)); err != nil {
+		log.Fatalf("s2.ApplyBPF failed: %s", err)
+	}
+
+	var eth layers.Ethernet
+	var ip6 layers.IPv6
+	var icmp6 layers.ICMPv6
+	var ping layers.ICMPv6Echo
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip6, &icmp6, &ping)
+	decoded := []gopacket.LayerType{}
+
+	for {
+		_, data, err := ReadMultiSocksOnce([]*Socket{s1, s2})
+		if err != nil {
+			log.Fatalf("ReadMultiSocksOnce failed: %s", err)
+		}
+		if err := parser.DecodeLayers(data, &decoded); err != nil {
+			log.Fatalf("parser.DecodeLayers failed: %s", err)
+		}
+		log.Printf("%+v", decoded)
 	}
 }

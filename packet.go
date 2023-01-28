@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net"
 
 	"github.com/google/gopacket"
@@ -68,7 +67,7 @@ func makeICMPv6[T gopacket.SerializableLayer](data ICMPv6Data[T]) []byte {
 		eth, ip6, icmpv6, data.Layer,
 	)
 	if err != nil {
-		log.Printf("failed to create packet: data=%+v, err=%s", data, err)
+		llog.Warning("failed to create packet: data=%+v, err=%s", data, err)
 	}
 	return buf.Bytes()
 }
