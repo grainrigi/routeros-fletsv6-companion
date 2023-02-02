@@ -143,7 +143,6 @@ func (p *ROSConnectionPool) Get() (*ROSConnection, error) {
 	// try established
 	p.mutex.Lock()
 	if len(p.cs) > 0 {
-		llog.Trace("ROSConnectionPool.Get(): Using established connection")
 		c := p.cs[0]
 		p.cs = p.cs[1:]
 		p.mutex.Unlock()
@@ -166,6 +165,21 @@ func NewROSClient(cfg ROSConnectConfig) (*ROSClient, error) {
 		cfg:  cfg,
 		pool: NewROSConnectionPool(cfg),
 	}
+
+	// tcp dial test
+	var conn net.Conn
+	var err error
+	llog.Debug("Running preflight connectivity check for RouterOS API")
+	addr := fmt.Sprintf("%s:%d", cfg.host, cfg.port)
+	if cfg.useTLS {
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: time.Second * 5}, "tcp", addr, &tls.Config{InsecureSkipVerify: true})
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, time.Second*5)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("RouterOS API preflight check failed: %s", err)
+	}
+	_ = conn.Close()
 
 	return c, nil
 }
@@ -345,7 +359,8 @@ func (c *ROSClient) ExportIPv6Pool(name string, cidr net.IPNet, prefixlen int) e
 func (c *ROSClient) LookupNeighbor(ip net.IP, timeoutms int, strict bool) (net.HardwareAddr, error) {
 	llog.Trace("LookupNeighbor(ip=%s, timeout=%d, strict=%v)", ip, timeoutms, strict)
 
-	llog.Trace("  pinging the client")
+	// trigger neighbor discovery by pinging
+	llog.Trace("  pinging the client (%s)", ip)
 	ping := func() (*routeros.Reply, error) {
 		return c.RunArgs([]string{
 			"/ping",
@@ -363,7 +378,7 @@ func (c *ROSClient) LookupNeighbor(ip net.IP, timeoutms int, strict bool) (net.H
 	llog.Trace("  ping success: %v", pingSuccess)
 
 	// lookup neighbor entry (cached)
-	llog.Trace("  lookup the neighbor entry")
+	llog.Trace("  looking up the neighbor entry of %s", ip)
 	rep, err := c.RunArgs([]string{
 		"/ipv6/neighbor/print",
 		"=.proplist=mac-address,status",
@@ -372,49 +387,27 @@ func (c *ROSClient) LookupNeighbor(ip net.IP, timeoutms int, strict bool) (net.H
 	if err != nil {
 		return nil, err
 	}
+	c.dumpResponse(rep)
 	if len(rep.Re) > 0 && (rep.Re[0].Map["status"] == "reachable" || rep.Re[0].Map["status"] == "stale") {
 		hwaddr, err := net.ParseMAC(rep.Re[0].Map["mac-address"])
 		// trigger (to update cache)
 		go ping()
 		return hwaddr, err
+	} else if !strict && pingSuccess {
+		llog.Trace("  neighbor entry not found but report success since pinging succeeded")
+		return make(net.HardwareAddr, 6), nil
 	}
+	llog.Trace("  neighbor entry not found")
 
-	// trigger neighbor discovery by pinging
-	_, err = c.RunArgs([]string{
-		"/ping",
-		fmt.Sprintf("=address=%s", ip.String()),
-		"=count=1",
-		fmt.Sprintf("=interval=00:00:0%d.%03d", timeoutms/1000, timeoutms%1000),
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// lookup neighbor entry
-	rep, err = c.RunArgs([]string{
-		"/ipv6/neighbor/print",
-		"=.proplist=mac-address,status",
-		fmt.Sprintf("?address=%s", ip.String()),
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(rep.Re) == 0 || rep.Re[0].Map["status"] != "reachable" {
-		if !strict && pingSuccess {
-			llog.Trace("  neighbor entry not found but report success since pinging succeeded")
-			return make(net.HardwareAddr, 6), nil
-		}
-		llog.Trace("  neighbor entry not found")
-		return nil, nil
-	}
-	hwaddr, err := net.ParseMAC(rep.Re[0].Map["mac-address"])
-	return hwaddr, err
+	return nil, nil
 }
 
 func (c *ROSClient) AssignIPv6(ifname string, ip *net.IPNet, key string, options ROSIPOptions) error {
+	llog.Trace("AssignIPv6(ifname=%s, ip=%s, key=%s, options=%+v", ifname, ip, key, options)
 	comment := fmt.Sprintf("%s %s", rosCommentKey, key)
 
 	// check ip assignment state
+	llog.Trace("  fetching current ip assignment")
 	rep, err := c.RunArgs([]string{
 		"/ipv6/address/print",
 		"=.proplist=.id,comment,address,advertise,eui-64",
@@ -427,6 +420,7 @@ func (c *ROSClient) AssignIPv6(ifname string, ip *net.IPNet, key string, options
 	if err != nil {
 		return err
 	}
+	c.dumpResponse(rep)
 	id := ""
 	for _, s := range rep.Re {
 		props := s.Map

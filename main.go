@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 
 	"github.com/grainrigi/routeros-fletsv6-companion/logger"
 )
@@ -23,13 +22,13 @@ func startDaemon(ctx context.Context, f func(context.Context) error) {
 func main() {
 	racfg, err := loadRAConfig()
 	if err != nil {
-		log.Fatal(err)
+		llog.Fatal("%s", err)
 	}
 	dumpRAConfig(racfg)
 
 	ndcfg, ndNeedROS, err := loadNDConfig(racfg)
 	if err != nil {
-		log.Fatal(err)
+		llog.Fatal("%s", err)
 	}
 	dumpNDConfig(ndcfg)
 
@@ -40,11 +39,11 @@ func main() {
 	if racfg.mode == "ros" || ndNeedROS {
 		roscfg, err := loadROSConfig()
 		if err != nil {
-			log.Fatal(err)
+			llog.Fatal("%s", err)
 		}
 		ros, err = NewROSClient(roscfg)
 		if err != nil {
-			log.Fatalf("Failed to initialize RouterOS API: %s", err)
+			llog.Fatal("Failed to initialize RouterOS API: %s", err)
 		}
 	}
 

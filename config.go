@@ -117,7 +117,11 @@ func loadRAConfig() (*RAConfig, error) {
 		return &cfg, nil
 	}
 
-	cfg.extIfs = strings.Split(os.Getenv("RA_EXTERNAL_INTERFACES"), ",")
+	extIfs := os.Getenv("RA_EXTERNAL_INTERFACES")
+	if extIfs == "" {
+		extIfs = "eth0"
+	}
+	cfg.extIfs = strings.Split(extIfs, ",")
 	timeoutStr := os.Getenv("RA_TIMEOUT")
 	if timeoutStr == "" {
 		timeoutStr = "5000"
@@ -273,6 +277,12 @@ func loadNDConfig(racfg *RAConfig) (*NDConfig, bool, error) {
 			continue
 		}
 		if advMAC[0] == '@' {
+			if advMAC == "@@external" {
+				if racfg.rosExtIf == "" {
+					return nil, false, fmt.Errorf("@external specified in NDP_ADVERTISE_MACS but RA_ROS_EXTERNAL_INTERFACE is empty")
+				}
+				advMAC = fmt.Sprintf("@%s", racfg.rosExtIf)
+			}
 			cfg.advMACs = append(cfg.advMACs, MACRef{rosIf: advMAC[1:]})
 			needROS = true
 		} else {

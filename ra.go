@@ -134,8 +134,12 @@ func (c *RAClient) receive(ctx context.Context, timeout bool) (*RouterInfo, erro
 	if timeout {
 		to = &c.cfg.timeout
 	}
+	timeoutStr := "nil"
+	if to != nil {
+		timeoutStr = fmt.Sprintf("%dms", *to/time.Millisecond)
+	}
 
-	llog.Debug("Waiting for router advertisement on %s (timeout=%d)", c.extSock.netif.Name, c.cfg.timeout/time.Millisecond)
+	llog.Debug("Waiting for router advertisement on %s (timeout=%s)", c.extSock.netif.Name, timeoutStr)
 	select {
 	case result := <-c.extSock.ReadOnceChan(to):
 		if result.err != nil {

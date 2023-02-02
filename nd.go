@@ -177,7 +177,7 @@ func (c *NDClient) processNd(targetIP net.IP, srcMAC net.HardwareAddr, srcIP net
 			}
 			ref.advMAC.hwaddr = mac
 		}
-		llog.Debug("Sending out Neighbor Advertisement: srcMAC=%s, dstMAC=%s", ref.advMAC.hwaddr, srcMAC)
+		llog.Debug("Sending out Neighbor Advertisement: targetIP=%s srcMAC=%s, dstMAC=%s", targetIP, ref.advMAC.hwaddr, srcMAC)
 		// sending out NA (synchronized)
 		na := makeICMPv6(ICMPv6Data[*layers.ICMPv6NeighborAdvertisement]{
 			SrcMAC: ref.advMAC.hwaddr,
@@ -232,7 +232,7 @@ func (c *NDClient) workInternal(context.Context) error {
 	}
 main:
 	for {
-		si, packet, err := ReadMultiSocksOnce(extSocks)
+		si, packet, err := ReadMultiSocksOnce(extSocks, nil)
 		if err != nil {
 			return err
 		}
@@ -296,5 +296,67 @@ func (c *NDClient) Work(ctx context.Context) error {
 }
 
 func (c *NDClient) solicitInternal(ip net.IP) (net.HardwareAddr, error) {
+	socks := make([]*Socket, len(c.intSocks))
+	sockRefs := make([]SockRef, len(c.intSocks))
+	// send nd
+	dstIP, dstMAC := multicastAddr(ip)
+	i := 0
+	for _, s := range c.intSocks {
+		packet := makeICMPv6(ICMPv6Data[*layers.ICMPv6NeighborSolicitation]{
+			Type:   135,
+			SrcMAC: s.s.netif.HardwareAddr,
+			DstMAC: dstMAC,
+			SrcIP:  s.s.LinkLocal(),
+			DstIP:  dstIP,
+			Layer: &layers.ICMPv6NeighborSolicitation{
+				TargetAddress: ip,
+				Options: []layers.ICMPv6Option{
+					{Type: 1, Data: s.s.netif.HardwareAddr},
+				},
+			},
+		})
+		s.s.FlushAll()
+		llog.Trace("  sending out nd via %s", s.name)
+		if err := s.s.WriteOnce(packet); err != nil {
+			return nil, err
+		}
+		socks[i] = s.s
+		sockRefs[i] = s
+		i++
+	}
+	// wait for na
+	var remain *time.Duration
+	if c.cfg.timeoutMs != 0 {
+		remain = new(time.Duration)
+		*remain = time.Millisecond * time.Duration(c.cfg.timeoutMs)
+	}
+	for remain == nil || *remain > 0 {
+		var na ICMPv6Data[*layers.ICMPv6NeighborAdvertisement]
+
+		start := time.Now()
+
+		si, packet, err := ReadMultiSocksOnce(socks, remain)
+		if err != nil {
+			return nil, err
+		}
+		if si == -1 {
+			break // timed out
+		}
+		err = parseICMPv6(packet, &na)
+		if err != nil {
+			llog.Warning("  failed to parse na packet from %s: %+v", sockRefs[si].name, packet)
+			goto next
+		}
+		if !na.Layer.TargetAddress.Equal(ip) {
+			goto next
+		}
+
+		return na.SrcMAC, nil
+
+	next:
+		*remain -= time.Now().Sub(start)
+	}
+
+	llog.Trace("  nd solicitation timed out after %d ms", c.cfg.timeoutMs)
 	return nil, nil
 }

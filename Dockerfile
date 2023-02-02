@@ -1,4 +1,4 @@
-FROM arm32v7/golang:1.19-bullseye
+FROM golang:1.19-bullseye
 
 COPY / /src
 WORKDIR /src

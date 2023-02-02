@@ -1,4 +1,7 @@
+本プログラムは、RouterOS Container上で動作させることで、フレッツ光IPv6への接続を補助できるユーティリティです。
+
 # 機能
+
 
 - Router Advertisement受信機能
   - Router Advertisementの受信(プレフィックス・ゲートウェイ)
@@ -8,9 +11,136 @@
     - インターフェースへのIPv6アドレス付与
     - IPv6 Poolへのプレフィックスの登録
 - Neighbor Discoveryプロキシ(NDProxy)機能
-  - 
+  - 外部からの近隣要請への代理応答
+    - 任意のソースMACアドレスを用いて応答可能
+  - 複数の代理問い合わせ方式
+    - 特定のネットワーク範囲に常に応答(static)
+    - 内部ネットワークへ近隣要請を送信(proxy)
+    - RouterOS APIを利用したRouterBoardからの近隣要請(proxy-ros)
+  
 
-# 設定方法
+
+
+# 構成例
+
+![](assets/routeros-fletsv6-companion-1.png)
+
+この構成例では、RouterOSからpingを送信させることでNeighbor Discoveryを行う方式を利用します。
+内部ネットワークをコンテナに接続する必要がないため、インターフェースの設定が簡単になります。
+
+以下にこの構成を準備するための手順を示します。
+
+### 必要なインターフェースの準備
+
+まず、外部ネットワークと内部ネットワークを分割するため、Bridge VLAN Filteringを用いて外部ネットワーク用のVLANを準備します。
+
+※ Bridge VLAN Filteringの利用を推奨しますが、複数のBridgeを用いた分割でも動作させることは可能です
+
+今回は、ブリッジ`bridge`に全てのデバイスを所属させており、うち`ether1`を外部ネットワークに接続するものとします。
+また、内部ネットワークをVLAN ID 1(Native)に、外部ネットワークをVLAN ID 50に割り当てます。
+
+以下のコマンドにより外部ネットワーク用のVLAN(ID=50)を準備します。
+
+```sh
+/interface/bridge/port/set numbers=[find interface=ether1] pvid=50 # ether1のnative vlan(PVID)を50に変更
+/interface/bridge/vlan/add bridge=bridge vlan-ids=50 tagged=bridge # vlan 50のパケットをCPU Portに出力
+/interface/vlan/add name=vlanflets interface=bridge vlan-id=50
+```
+
+次に、companionを接続させるためのVETHデバイスを作成し、VLAN50に接続します。
+また、RouterOS APIにアクセスできるように、IPアドレスとゲートウェイを適切に設定します。
+
+```sh
+/interface/veth/add name=veth1 address=172.18.0.2/24 gateway=172.18.0.1
+/interface/bridge/port/add bridge=bridge interface=veth1 pvid=50
+/ip/address/add interface=vlanflets address=172.18.0.1/24
+```
+
+さらに、内部ネットワークでRAを送出するよう設定します。
+
+```
+/ipv6/nd/add interface=bridge
+```
+
+### API接続用ユーザーの作成
+
+API接続用にユーザーを作成します。パスワードは強力なものを適宜設定してください。
+
+```
+/user/add name=fletsv6 address=172.18.0.2 group=full password=password
+```
+
+### routeros-fletsv6-companionの設定
+
+環境変数に必要なパラメータを入力します。
+動作確認のため、DEBUGログを有効化します。
+
+```
+/container/envs/add name=fletsv6 key=ROS_HOST value=172.18.0.1
+/container/envs/add name=fletsv6 key=ROS_USER value=fletsv6
+/container/envs/add name=fletsv6 key=ROS_PASSWORD value=password
+/container/envs/add name=fletsv6 key=RA_ROS_EXTERNAL_INTERFACE value=vlanflets
+/container/envs/add name=fletsv6 key=RA_ROS_EXTERNAL_IPS value=ra-prefix::1/128@@external
+/container/envs/add name=fletsv6 key=RA_ROS_INTERNAL_IPS value=ra-prefix::2/64@bridge:advertise
+/container/envs/add name=fletsv6 key=LOG_LEVEL value=DEBUG
+```
+
+次に、コンテナを作成します。
+
+※イメージのPull完了まではしばらく時間がかかります
+
+```
+/container/config/set registry-url="https://registry-1.docker.io" tmpdir="imgpull"
+/container/add remote-image=grainrigi/routeros-fletsv6-companion:latest interface=veth1 envlist=fletsv6 logging=yes
+```
+
+### 起動・動作確認
+
+ether1をフレッツ光のONUに接続し、コンテナを起動します。
+
+```
+/container start 0
+```
+
+Router Advertismentが受信され、適切にIP・ゲートウェイが設定されていることを確認します。
+
+※アドレス・ルートに付与されたコメントは正しい動作に必要であるため、変更・削除は行わないでください
+
+```
+> /ipv6/address/print
+Flags: D - DYNAMIC; G, L - LINK-LOCAL
+Columns: ADDRESS, INTERFACE, ADVERTISE
+ #    ADDRESS                     INTERFACE       ADVERTISE
+;;; set by fletsv6-companion ra-prefix::1111:1111:1111:1111/128
+0   G 2001:db8:aaa2:578b::1/128   vlanflets       no  
+;;; set by fletsv6-companion ra-prefix::1/64
+1   G 2001:db8:aaa2:578b::2/64    bridge          yes 
+...
+
+> /ipv6/route/print
+Flags: D - DYNAMIC; A - ACTIVE; c, s, y - COPY
+Columns: DST-ADDRESS, GATEWAY, DISTANCE
+#     DST-ADDRESS                                  GATEWAY                             DISTANCE
+;;; set by fletsv6-companion
+0  As ::/0                                         fe80::21f:6cff:fe25:f4c4%vlanflets         1
+...
+```
+
+
+また、内部クライアントからpingを打ち、適切にND Advertisementが送出されていることを確認します。
+
+```
+> /logs/print
+...
+23:45:18 container,info,debug 2023/02/02 14:45:18 [DEBUG] nd.go:246: Received an nd solicitation: targetIP=2001:db8:aaa2:578b:ba27:ebff:fef6:f8f srcMAC=00:1f:6c:25:f4:c4 
+23:45:18 container,info,debug 2023/02/02 14:45:18 [DEBUG] nd.go:170: SOLICITATION SUCCUSSFUL! 2001:db8:aaa2:578b:ba27:ebff:fef6:f8f is at b8:27:eb:f6:0f:8f
+23:45:18 container,info,debug 2023/02/02 14:45:18 [DEBUG] nd.go:180: Sending out Neighbor Advertisement: targetIP=2001:db8:aaa2:578b:ba27:ebff:fef8:f8f srcMAC=48:a9:8a:22:c8:c8, dstMAC=00:1f:6c:25:f4:c4 
+
+```
+
+
+
+# 設定
 
 ## RouterOS APIでTLSを使用する
 
@@ -43,12 +173,13 @@ X.509証明書はRouterOS内で生成できますので、自己署名証明書�
 | NDP_EXTERNAL_INTERFACES  | `eth0`               | 外部からのND Solicitationが着信するインターフェース(カンマ区切りで複数指定可能)   |
 | NDP_ADVERTISE_MACS | `@@external` | ND Advertisement送出時のソースMACアドレスを指定します。`@インターフェース名`と指定するとRouterOSの指定されたインターフェースのMACアドレスを取得して使用します。(RA機能使用時は`@external`も指定可能)カンマ区切りで複数指定可能、`ND_EXTERNAL_INTERFACES`の各項目と1:1で対応させます |
 | NDP_INTERNAL_INTERFACES | ``               | 近隣探索を行う内部ネットワークのインターフェース(カンマ区切りで複数指定可能)          |
-| NDP_TIMEOUT             | `1000` | 内部での近隣探索時の無応答タイムアウト(ミリ秒単位, `proxy-ros`の場合は10〜5000)
+| NDP_TIMEOUT             | `1000` | 内部での近隣探索時の無応答タイムアウト(ミリ秒単位, `proxy-ros`の場合は10〜5000, 0で無制限)
 | ROS_HOST         | -                 | RouterOS API エンドポイント                   |
 | ROS_PORT         | 8728(TLS時は8729) | RouterOS API 接続ポート                       |
 | ROS_USER         | `admin`           | RouterOS API 接続ユーザー名                   |
-| ROS_PASSWORD     | ``           | RouterOS API 接続ユーザー名                   |
+| ROS_PASSWORD     | ``           | RouterOS API 接続パスワード                   |
 | ROS_USETLS       | `0`               | RouterOS API接続時にTLSを利用するか(0 or 1)   |
+| LOG_LEVEL        | `INFO`            | ログの出力レベル、`ERROR`,`WARNING`,`INFO`,`DEBUG`,`TRACE`のうちいずれか(`TRACE`は大量のログが出力されるため注意してください)
 
 ※ インターフェースの指定時、`eth0@100`のように@をつけて指定すると特定のVLANタグを持つパケットのみを受信できます。なお、無指定のときはタグ付きとタグ無しの両方のパケットを受信します(タグ無しのパケットのみを受信することはできません)  
 ※ `ra-prefix`は単体でCIDRとして使うことも、サフィックスをつけてCIDR/IPとして使うこともできます。

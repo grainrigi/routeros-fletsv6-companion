@@ -120,12 +120,21 @@ func (s *Socket) WriteOnce(packet []byte) error {
 	return err
 }
 
-func ReadMultiSocksOnce(socks []*Socket) (int, []byte, error) {
-	s, err := epollOnce(socks, nil)
+func (s *Socket) FlushAll() {
+	for {
+		data, err := s.readImmediate()
+		if data == nil || err != nil {
+			return
+		}
+	}
+}
+
+func ReadMultiSocksOnce(socks []*Socket, timeout *time.Duration) (int, []byte, error) {
+	s, err := epollOnce(socks, timeout)
 	if err != nil {
 		return -1, nil, err
 	} else if s == nil {
-		return -1, nil, fmt.Errorf("epollOnce returned nil *Socket (it seems to be a bug)")
+		return -1, nil, nil // timeout
 	}
 
 	for i, so := range socks {

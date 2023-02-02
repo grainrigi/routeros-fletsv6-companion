@@ -216,7 +216,7 @@ func multiSockTest() {
 	decoded := []gopacket.LayerType{}
 
 	for {
-		_, data, err := ReadMultiSocksOnce([]*Socket{s1, s2})
+		_, data, err := ReadMultiSocksOnce([]*Socket{s1, s2}, nil)
 		if err != nil {
 			log.Fatalf("ReadMultiSocksOnce failed: %s", err)
 		}

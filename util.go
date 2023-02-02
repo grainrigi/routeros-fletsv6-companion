@@ -98,3 +98,9 @@ func maskedIPAssign(dst net.IP, src net.IP, mask net.IPMask) {
 		dst[i] = (src[i] & mask[i]) | (dst[i] & ^mask[i])
 	}
 }
+
+func multicastAddr(ip net.IP) (net.IP, net.HardwareAddr) {
+	mcip := append(net.IP{0xff, 0x02, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0x01, 0xff}, ip[13:16]...)
+	mcmac := append(net.HardwareAddr{0x33, 0x33}, mcip[12:16]...)
+	return mcip, mcmac
+}
